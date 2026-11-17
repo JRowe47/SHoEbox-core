@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shoebox-core"
-version = "0.1.0"
-description = "Sparse multiscale byte model with bounded memory and online local learning"
+version = "0.2.0"
+description = "HAT byte symbols, deep multifacet routing, sparse expert banks and online learning"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26"]
@@ -17,4 +17,4 @@ shoebox-core = "shoebox_core.__main__:main"
 packages = ["shoebox_core"]
 
 [tool.setuptools.package-data]
-shoebox_core = ["*.cpp", "*.hpp"]
+shoebox_core = ["*.cpp"]

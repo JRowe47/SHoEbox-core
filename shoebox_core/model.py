@@ -1,134 +1,84 @@
-"""NumPy interface to the self-contained C++17 model and online learner."""
+"""Streaming byte model with HAT, deep multifacet routing and sparse expert banks."""
 from __future__ import annotations
 
-import ctypes as C
+from copy import deepcopy
+from dataclasses import asdict, fields
 import hashlib
+from io import BytesIO
 import os
 from pathlib import Path
-import platform
-import subprocess
 import tempfile
-import threading
+from zipfile import BadZipFile
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-_LIB = None
-_BUILD_LOCK = threading.Lock()
-_RATE_NAMES = ("fast_rate", "slow_rate", "query_rate", "head_rate",
-               "auxiliary_weight", "route_rate", "reconstruction_weight")
+from . import _experts, _facets, _hat, _routing
+from ._common import ADDRESS, HAT_LEVELS, LINKS, SLOTS, SYMBOLS, WIDTH, integer, update
+from ._shape import Shape, parameter_count, resolve, weight_specs
+from .events import ByteEvents, as_bytes
+
+_RATE_NAMES = ("fast_rate", "query_rate", "route_rate", "head_rate")
+_MAGIC = b"SHOECR02"
+# For a leaf with index 256+byte in a one-based binary heap, its eight
+# internal ancestors are the successive right shifts. Store zero-based rows.
+_LEAVES = 256 + np.arange(256)[:, None]
+_PATHS = (_LEAVES >> np.arange(8, 0, -1)) - 1
+_SIGNS = (2 * ((_LEAVES >> np.arange(7, -1, -1)) & 1) - 1).astype(np.float32)
 
 
-def _library():
-    global _LIB
-    with _BUILD_LOCK:
-        if _LIB is not None:
-            return _LIB
-        compiler = os.environ.get("CXX", "g++")
-        flags = ["-std=c++17", "-O3", "-march=native", "-ffp-contract=off", "-fPIC", "-shared"]
-        source = b"".join(p.name.encode() + p.read_bytes() for p in sorted(HERE.glob("*.hpp")))
-        source += (HERE / "native.cpp").read_bytes()
-        signature = subprocess.check_output([compiler, "--version"])
-        # Native instructions are host-specific; include the CPU fingerprint
-        # when a cache directory is shared between machines.
-        cpu = Path("/proc/cpuinfo")
-        hardware = platform.machine().encode()
-        if cpu.exists():
-            hardware += "\n".join(sorted({line for line in cpu.read_text().splitlines()
-                                         if line.startswith(("vendor_id", "model name", "flags", "Features"))})).encode()
-        key = hashlib.sha256(source + repr(flags).encode() + signature + hardware).hexdigest()[:24]
-        cache = Path(os.environ.get("SHOEBOX_CORE_CACHE", str(Path(tempfile.gettempdir()) / "shoebox_core")))
-        cache.mkdir(parents=True, exist_ok=True)
-        path = cache / f"core_{key}.so"
-        if not path.exists():
-            fd, name = tempfile.mkstemp(prefix="build_", suffix=".so", dir=cache)
-            os.close(fd)
-            temporary = Path(name)
-            try:
-                subprocess.run([compiler, *flags, str(HERE / "native.cpp"), "-o", name], check=True)
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
-        lib = C.CDLL(str(path))
-        p, i, n = C.c_void_p, C.c_int, C.c_size_t
-        specs = {
-            "ms_error": ([], C.c_char_p),
-            "ms_create": ([i, i, C.c_uint32], p),
-            "ms_destroy": ([p], None), "ms_clone": ([p, i, i], p),
-            "ms_run": ([p, p, p, n, C.POINTER(C.c_double)], i),
-            "ms_observe": ([p, C.c_uint8, p], i), "ms_logits": ([p, p], i),
-            "ms_reset": ([p], i), "ms_finish": ([p], i),
-            "ms_configure": ([p, p], i), "ms_stats": ([p, p], i),
-            "ms_save_size": ([p], n), "ms_save": ([p, p, n], i), "ms_load": ([p, n], p),
-        }
-        for name, (args, result) in specs.items():
-            fn = getattr(lib, name)
-            fn.argtypes, fn.restype = args, result
-        _LIB = lib
-        return lib
+def _events(data):
+    return data if isinstance(data, ByteEvents) else ByteEvents.static(data)
 
 
-def _bytes(data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        return np.frombuffer(data, dtype=np.uint8)
-    array = np.asarray(data)
-    if array.ndim != 1 or array.dtype != np.uint8:
-        raise TypeError("expected bytes, text, or a one-dimensional uint8 array")
-    return np.ascontiguousarray(array)
-
-
-def _integer(value, name, low, high):
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or not low <= value <= high:
-        raise ValueError(f"{name} must be an integer in {low}..{high}")
-    return int(value)
+def _empty_context(s):
+    return {
+        "memory": np.zeros((LINKS, HAT_LEVELS, ADDRESS, ADDRESS), np.float32),
+        "clocks": np.zeros(LINKS, np.uint64), "features": np.zeros(WIDTH, np.float32),
+        "bank_calls": np.zeros(s.banks, np.uint64),
+        "address": np.full(3, -1, np.int32),
+        "symbols": np.full((HAT_LEVELS, 2), -1, np.int32),
+        "nodes": np.full((s.levels, s.live_nodes), -1, np.int32),
+        "node_weights": np.zeros((s.levels, s.live_nodes), np.float32),
+        "experts": np.full(s.active_experts, -1, np.int32),
+        "expert_weights": np.zeros(s.active_experts, np.float32),
+    }
 
 
 class Model:
-    """Sparse byte model with 1/4-byte experts and 16/64-byte summaries.
+    """One mutable stream with immediate next-byte SGD and bounded HAT memory.
 
-    `parameters` is a nominal fitted-parameter budget; `parameter_count` gives
-    the actual count. `levels` keeps the first 1..4 scales. Width remains 64.
-    Each instance owns mutable stream state; use separate clones for concurrent
-    work. Creating an inference copy never changes the source's pending credit.
+    The default is the six-level MFS preset. An explicit expert count fixes the
+    physical bank capacity. Otherwise a nominal parameter budget sizes it.
     """
 
-    def __init__(self, *, parameters=1_000_000, seed=7, levels=4):
-        parameters = _integer(parameters, "parameters", 50_000, 100_000_000)
-        seed = _integer(seed, "seed", 0, 2**32 - 1)
-        levels = _integer(levels, "levels", 1, 4)
-        self._lib = _library()
-        self._handle = self._lib.ms_create(levels, parameters, seed)
-        self._check_pointer()
-
-    def _check_pointer(self):
-        if not self._handle:
-            raise RuntimeError(self._lib.ms_error().decode())
-
-    def _check(self, code):
-        if code:
-            raise RuntimeError(self._lib.ms_error().decode())
+    def __init__(self, *, parameters=None, seed=7, levels=6, nodes=None, facets=None,
+                 live_nodes=None, banks=4, experts=None, active_experts=None):
+        seed = integer(seed, "seed", 0, 2**32 - 1)
+        self._shape = resolve(parameters=parameters, levels=levels, nodes=nodes, facets=facets,
+                              live_nodes=live_nodes, banks=banks, experts=experts,
+                              active_experts=active_experts)
+        _facets._library()
+        rng = np.random.default_rng(seed)
+        self._weights = {}
+        for name, (dims, std) in weight_specs(self._shape).items():
+            values = rng.standard_normal(dims, dtype=np.float32) * std if std else np.zeros(dims, np.float32)
+            if name.endswith((".scale", "_gain")):
+                values += 1
+            elif name.endswith(".out_bias"):
+                values.fill(3.)
+            elif name.endswith(".dt_bias"):
+                values -= 3.7
+            elif name == "hat0.log_speed":
+                values.fill(np.log(4.))
+            self._weights[name] = values
+        self._graph = self._shape.make_links(rng)
+        self._rates = np.array([.04, .025, .02, .16], np.float32)
+        self._training = True
+        self._state = _empty_context(self._shape)
 
     def _alive(self):
-        if not self._handle:
+        if self._weights is None:
             raise RuntimeError("model has been closed")
-        return self._handle
-
-    @classmethod
-    def _wrap(cls, handle):
-        obj = cls.__new__(cls)
-        obj._lib, obj._handle = _library(), handle
-        obj._check_pointer()
-        return obj
-
-    def close(self):
-        if getattr(self, "_handle", None):
-            self._lib.ms_destroy(self._handle)
-            self._handle = None
-
-    def __del__(self):
-        self.close()
 
     def __enter__(self):
         self._alive()
@@ -137,135 +87,227 @@ class Model:
     def __exit__(self, *exc):
         self.close()
 
-    def run(self, inputs, targets):
-        """Consume aligned input/target bytes and return mean NLL in nats/byte.
+    def close(self):
+        self._weights = self._graph = self._state = None
 
-        Trainable instances update online. Frozen copies only score. Call with
-        consecutive x/y slices to retain every next-byte pair across chunks.
-        """
-        x, y = _bytes(inputs), _bytes(targets)
-        if x.size != y.size or not x.size:
+    def _forward(self, byte, link, slot):
+        w, s, shape = self._weights, self._state, self._shape
+        payload, symbols = _hat.encode(w, s["memory"], byte, link, slot)
+        ids, gates, messages, route = _routing.route(w, shape, self._graph, payload)
+        features, experts = _experts.execute(w, shape, payload, ids, gates, messages)
+        s["features"] = features
+        s["clocks"][link] += 1
+        s["bank_calls"] += np.bincount(experts.address[0], minlength=shape.banks).astype(np.uint64)
+        s["address"][:] = byte, link, slot
+        for i, symbol in enumerate(symbols.steps):
+            s["symbols"][i] = symbol.symbols
+        for i, stage in enumerate(route[1]):
+            s["nodes"][i] = stage.ids
+            s["node_weights"][i] = stage.mass
+        s["experts"][:] = ids
+        s["expert_weights"][:] = gates
+        return payload, symbols, route, experts
+
+    def _score(self, target, tape):
+        w, s = self._weights, self._state
+        ids, signs = _PATHS[target], _SIGNS[target]
+        features = s["features"]
+        head = w["head"][ids]
+        logits = head @ features + w["head_bias"][ids]
+        errors = np.logaddexp(0., -signs * logits)
+        if self._training:
+            fast, query, routing, head_rate = self._rates
+            grad = -signs * np.exp(-np.logaddexp(0., signs * logits))
+            dfeatures = grad @ head
+            update(w["head"], np.outer(grad, features), head_rate / (1 + features @ features), ids)
+            update(w["head_bias"], grad, head_rate * .05, ids)
+            payload, symbols, route, experts = tape
+            dp, dm, dmsg = _experts.backward(w, experts, s["expert_weights"], dfeatures, fast)
+            dp += _routing.backward(w, payload, route, dm, dmsg, routing)
+            byte, link, slot = s["address"]
+            _hat.backward(w, symbols, dp, byte, link, slot, query)
+        return float(errors.sum())
+
+    def run(self, inputs, targets):
+        """Consume aligned input events and target bytes, returning mean NLL."""
+        self._alive()
+        events = _events(inputs)
+        target = targets.values if isinstance(targets, ByteEvents) else as_bytes(targets)
+        if not target or len(events.values) != len(target):
             raise ValueError("inputs and targets must have the same nonzero length")
-        loss = C.c_double()
-        self._check(self._lib.ms_run(self._alive(), x.ctypes.data, y.ctypes.data, x.size, C.byref(loss)))
-        return loss.value
+        loss = 0.
+        for byte, link, slot, y in zip(events.values, events.links, events.slots, target):
+            tape = self._forward(byte, link, slot)
+            loss += self._score(y, tape)
+        return loss / len(target)
 
     def train(self, data):
-        """Train on len(data)-1 next-byte pairs without resetting or flushing."""
-        if not self.stats()["training"]:
+        """Train on adjacent byte pairs. Use run for aligned streaming chunks."""
+        self._alive()
+        if not self._training:
             raise RuntimeError("this is a frozen inference model")
-        data = _bytes(data)
-        return self.run(data[:-1], data[1:])
+        events = _events(data)
+        return self.run(events[:-1], events.values[1:])
 
     def logits(self):
-        """Return normalized log probabilities for all 256 next bytes."""
-        out = np.empty(256, np.float32)
-        self._check(self._lib.ms_logits(self._alive(), out.ctypes.data))
-        return out
+        """Return normalized natural log probabilities for all 256 next bytes."""
+        self._alive()
+        z = self._weights["head"] @ self._state["features"] + self._weights["head_bias"]
+        return -np.logaddexp(0., -_SIGNS * z[_PATHS]).sum(axis=1)
 
-    def observe(self, byte):
-        """Consume one observed byte on a frozen copy; return next-byte log probabilities."""
-        byte = _integer(byte, "byte", 0, 255)
-        out = np.empty(256, np.float32)
-        self._check(self._lib.ms_observe(self._alive(), byte, out.ctypes.data))
-        return out
+    def observe(self, byte, *, link=0, slot=None):
+        """Advance a frozen model by one addressed event and return predictions."""
+        self._alive()
+        if self._training:
+            raise RuntimeError("observe requires an inference copy")
+        byte = integer(byte, "byte", 0, 255)
+        link = integer(link, "link", 0, LINKS - 1)
+        slot = byte if slot is None and link == 0 else integer(slot, "slot", 0, SLOTS - 1)
+        if link == 0 and slot != byte:
+            raise ValueError("static dictionary slot must equal the byte")
+        self._forward(byte, link, slot)
+        return self.logits()
 
     def clone(self):
-        """Copy weights, stream state, pending updates and frozen/trainable status."""
-        return self._wrap(self._lib.ms_clone(self._alive(), 0, 0))
+        self._alive()
+        return deepcopy(self)
 
     def inference_copy(self, *, cold=True):
-        """Freeze current weights; clear context by default, retain it with cold=False."""
-        return self._wrap(self._lib.ms_clone(self._alive(), 1, int(bool(cold))))
+        model = self.clone()
+        model._training = False
+        if cold:
+            model.reset_context()
+        return model
 
     def evaluate(self, data):
-        """Score from empty context without modifying this model."""
-        data = _bytes(data)
-        with self.inference_copy() as model:
-            return model.run(data[:-1], data[1:])
+        events = _events(data)
+        with self.inference_copy() as frozen:
+            return frozen.run(events[:-1], events.values[1:])
 
     def generate(self, prompt, *, length=256, temperature=.8, seed=7):
-        """Return the UTF-8 prompt bytes plus sampled continuation bytes."""
-        data = _bytes(prompt)
-        length = _integer(length, "length", 0, 2**63 - 1)
-        if not data.size or not np.isfinite(temperature) or temperature <= 0:
+        """Return prompt bytes and a sampled continuation from a cold frozen copy."""
+        prompt = _events(prompt)
+        length = integer(length, "length", 0, 2**63 - 1)
+        if not prompt.values or not np.isfinite(temperature) or temperature <= 0:
             raise ValueError("a nonempty prompt and finite positive temperature are required")
+        result = bytearray(prompt.values)
         rng = np.random.default_rng(seed)
-        result = bytearray(data.tobytes())
-        with self.inference_copy() as model:
-            for byte in data:
-                logits = model.observe(int(byte))
+        with self.inference_copy() as frozen:
+            for byte, link, slot in zip(prompt.values, prompt.links, prompt.slots):
+                frozen._forward(byte, link, slot)
             for _ in range(length):
-                z = logits.astype(np.float64) / temperature
-                probabilities = np.exp(z - z.max())
-                byte = int(rng.choice(256, p=probabilities / probabilities.sum()))
+                z = frozen.logits().astype(np.float64)
+                probs = np.exp((z - z.max()) / temperature)
+                byte = int(rng.choice(256, p=probs / probs.sum()))
                 result.append(byte)
-                logits = model.observe(byte)
+                frozen._forward(byte, 0, byte)
         return bytes(result)
 
     def finish(self):
-        """Apply pending local gradients at an explicit truncation boundary."""
-        self._check(self._lib.ms_finish(self._alive()))
+        """All credit has already been applied when run() returns."""
+        self._alive()
 
     def reset_context(self):
-        """Finish pending credit, then clear recurrent state and retained memory."""
-        self._check(self._lib.ms_reset(self._alive()))
+        self._alive()
+        self._state = _empty_context(self._shape)
 
-    def configure(self, *, fast_rate=None, slow_rate=None, query_rate=None,
-                  head_rate=None, auxiliary_weight=None, route_rate=None,
-                  reconstruction_weight=None):
-        """Set independent learning rates/weights; omitted values stay unchanged."""
-        updates = (fast_rate, slow_rate, query_rate, head_rate, auxiliary_weight,
-                   route_rate, reconstruction_weight)
-        current = self.stats()["learning_rates"]
-        values = [current[name] if value is None else value for name, value in zip(_RATE_NAMES, updates)]
-        if any(not np.isfinite(v) or v < 0 or v > np.finfo(np.float32).max for v in values):
-            raise ValueError("rates and weights must be finite nonnegative float32 values")
-        rates = np.asarray(values, dtype=np.float32)
-        self._check(self._lib.ms_configure(self._alive(), rates.ctypes.data))
-
-    def stats(self):
-        out = np.empty(80, np.float64)
-        self._check(self._lib.ms_stats(self._alive(), out.ctypes.data))
-        count = int(out[3])
-        names = ("experts", "events", "updates", "pending", "constituent_pending",
-                 "pending_children", "retained_units", "native_targets", "native_loss_sum",
-                 "reconstruction_targets", "reconstruction_loss_sum", "state_energy",
-                 "routing_events", "routing_seeded", "constituent_credit_edges", "content_updates")
-        result = dict(parameters=int(out[0]), bytes=int(out[1]), training=bool(out[2]),
-                      levels=count, level_kinds=["expert" if i < 2 else "summary" for i in range(count)],
-                      constituent_epoch_bytes=int(out[4]), constituent_epoch_limit=int(out[5]),
-                      route_comparisons=int(out[6]), checkpoint_version="shoebox-core-1",
-                      learning_rates=dict(zip(_RATE_NAMES, out[8:15].tolist())))
-        for j, name in enumerate(names):
-            cast = float if j in (8, 10, 11) else int
-            result[name] = [cast(out[16 + 16*i + j]) for i in range(count)]
-        return result
+    def configure(self, *, fast_rate=None, query_rate=None, route_rate=None, head_rate=None):
+        """Set learning rates for expert MLPs, HAT, MFS and byte readout."""
+        self._alive()
+        values = (fast_rate, query_rate, route_rate, head_rate)
+        rates = [old if new is None else new for old, new in zip(self._rates, values)]
+        if any(not np.isfinite(v) or v < 0 or v > np.finfo(np.float32).max for v in rates):
+            raise ValueError("rates must be finite nonnegative float32 values")
+        self._rates[:] = rates
 
     @property
     def parameter_count(self):
-        return self.stats()["parameters"]
+        self._alive()
+        return parameter_count(self._shape)
+
+    def stats(self):
+        self._alive()
+        s = self._shape
+        events = sum(map(int, self._state["clocks"]))
+        return dict(architecture="hat-mfs-shoe", checkpoint_version="shoebox-core-2",
+                    parameters=self.parameter_count, bytes=events, training=self._training,
+                    **asdict(s), level_kinds=["mfs"] * s.levels, events=[events] * s.levels,
+                    expert_calls=self._state["bank_calls"].tolist(), parent_degree=s.degree,
+                    leaf_links=s.leaf_links, nominations=s.nominations, hat_levels=HAT_LEVELS,
+                    hat_symbols=SYMBOLS, symbols_per_level=2, link_clocks=self._state["clocks"].tolist(),
+                    learning_rates=dict(zip(_RATE_NAMES, self._rates.tolist())))
+
+    def last_route(self):
+        """Return a snapshot of the last occurrence's HAT, controller and expert IDs."""
+        self._alive()
+        state = self._state
+        if state["address"][0] < 0:
+            return None
+        byte, link, slot = map(int, state["address"])
+        bank_size = self._shape.experts // self._shape.banks
+        return dict(byte=byte, link=link, slot=slot, symbols=state["symbols"].copy(),
+                    nodes=state["nodes"].copy(), node_weights=state["node_weights"].copy(),
+                    experts=state["experts"].copy(), expert_weights=state["expert_weights"].copy(),
+                    bank_addresses=np.stack(np.divmod(state["experts"], bank_size), axis=-1))
 
     def dumps(self):
-        """Serialize exact state without applying pending updates."""
-        size = self._lib.ms_save_size(self._alive())
-        if not size:
-            raise RuntimeError(self._lib.ms_error().decode())
-        buffer = C.create_string_buffer(size)
-        self._check(self._lib.ms_save(self._alive(), buffer, size))
-        raw = buffer.raw
-        return b"SHOECR01" + hashlib.sha256(raw).digest() + raw
+        """Serialize parameters, topology, rates, stream state and last route."""
+        self._alive()
+        out = BytesIO()
+        arrays = {"w." + k: v for k, v in self._weights.items()}
+        arrays.update({"s." + k: v for k, v in self._state.items()})
+        np.savez(out, topology=np.array(list(asdict(self._shape).values()), dtype=np.int32),
+                 links=self._graph, rates=self._rates, training=np.array(self._training), **arrays)
+        raw = out.getvalue()
+        return _MAGIC + hashlib.sha256(raw).digest() + raw
 
     @classmethod
     def loads(cls, data):
         data = bytes(data)
-        if len(data) < 40 or data[:8] != b"SHOECR01" or hashlib.sha256(data[40:]).digest() != data[8:40]:
+        if len(data) < 40 or hashlib.sha256(data[40:]).digest() != data[8:40]:
             raise ValueError("invalid or corrupted SHoEbox-core checkpoint")
-        raw = data[40:]
-        return cls._wrap(_library().ms_load(raw, len(raw)))
+        if data[:8] == b"SHOECR01":
+            raise ValueError("SHOECR01 uses the v0.1 summarizer topology. Load it with SHoEbox-core 647e320.")
+        if data[:8] != _MAGIC:
+            raise ValueError("unknown SHoEbox-core checkpoint format")
+        try:
+            with np.load(BytesIO(data[40:]), allow_pickle=False) as archive:
+                model = cls._restore(archive)
+        except (BadZipFile, EOFError, KeyError, OSError, TypeError) as exc:
+            raise ValueError("invalid SHoEbox-core checkpoint contents") from exc
+        return model
+
+    @classmethod
+    def _restore(cls, archive):
+        def array(name, dtype, shape):
+            value = archive[name]
+            if value.dtype != dtype or value.shape != shape:
+                raise ValueError(f"invalid checkpoint array {name}")
+            if value.dtype.kind == "f" and not np.isfinite(value).all():
+                raise ValueError(f"nonfinite checkpoint array {name}")
+            return value
+
+        names = [field.name for field in fields(Shape)]
+        config = dict(zip(names, array("topology", np.int32, (len(names),))))
+        model = cls.__new__(cls)
+        shape = model._shape = resolve(parameters=None, **config)
+        model._weights = {k: array("w." + k, np.float32, dims)
+                          for k, (dims, _) in weight_specs(shape).items()}
+        model._state = {k: array("s." + k, v.dtype, v.shape)
+                        for k, v in _empty_context(shape).items()}
+        graph = model._graph = array("links", np.int32, (shape.nodes, shape.leaf_links))
+        if (np.any(graph < 0) or np.any(graph >= shape.experts)
+                or np.any(np.diff(np.sort(graph, axis=1), axis=1) == 0)
+                or np.any(np.bincount(graph.ravel(), minlength=shape.experts) != shape.degree)):
+            raise ValueError("invalid checkpoint leaf graph")
+        model._rates = array("rates", np.float32, (len(_RATE_NAMES),))
+        if np.any(model._rates < 0):
+            raise ValueError("invalid checkpoint rates")
+        model._training = bool(array("training", np.bool_, ()))
+        _facets._library()
+        return model
 
     def save(self, path):
-        """Atomically save a core checkpoint, including unfinished groups."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
