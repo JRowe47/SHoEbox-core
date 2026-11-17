@@ -1,0 +1,78 @@
+#pragma once
+void Model::routing_prepare(int scale,Event& e,int slot){
+    auto& l=levels[scale];auto& r=l.routing;auto& t=r.events[slot];t=RoutingTrace{};
+    t.expert_input=e.input;
+    Vec prior_mean=r.mean,extra{};
+
+    // Means and balancing statistics only observe training inputs.
+    if(training){
+        float alpha=1.f/std::min<uint64_t>(1024,r.seen+1);
+        for(int j=0;j<D;++j)r.mean[j]+=alpha*(e.input[j]-r.mean[j]);
+        if(!r.seeded){
+            r.seed_cues[r.seed_count]=e.input;
+            for(int j=0;j<D;++j)r.seed_cues[r.seed_count][j]+=extra[j];
+            ++r.seed_count;
+            if(r.seed_count==int(r.seed_cues.size())){
+                // Deterministic farthest-point initialization from actual cues.
+                auto cues=r.seed_cues;
+                for(auto& q:cues){for(int j=0;j<D;++j)q[j]-=r.mean[j];normalize(q);}
+                std::vector<float> nearest(cues.size(),-2.f);size_t pick=0;
+                for(size_t k=0;k<l.experts.size();++k){
+                    l.experts[k].key=cues[pick];
+                    if(energy(l.experts[k].key)<1e-10f)l.experts[k].key[k%D]=1;
+                    for(size_t i=0;i<cues.size();++i)nearest[i]=std::max(nearest[i],dot(cues[i].data(),l.experts[k].key.data()));
+                    pick=std::min_element(nearest.begin(),nearest.end())-nearest.begin();
+                }
+                r.seeded=1;rebuild_index(l);
+            }
+        }
+    }
+    for(int j=0;j<D;++j)t.cue[j]=e.input[j]-prior_mean[j]+extra[j];
+    t.norm=std::sqrt(energy(t.cue)+1e-4f);for(auto& x:t.cue)x/=t.norm;
+    // Normalized cue and unit prototypes bound semantic scores to [-1,1].
+    // Past-use bias changes selection, not gate magnitude/gradient.
+    int best=0,second=0;float a=-1e30f,b=-1e30f;
+    if(l.routing_keys.empty()){
+        for(size_t k=0;k<l.experts.size();++k){
+            ++route_comparisons;float score=dot(l.experts[k].key.data(),t.cue.data())+r.bias[k];
+            if(score>a){b=a;second=best;a=score;best=int(k);}else if(score>b){b=score;second=int(k);}
+        }
+    }else{
+        for(size_t first=0;first<l.experts.size();first+=16){
+            float scores[16]{};
+            const float* keys=l.routing_keys.data()+(first/16)*D*16;
+            routing_dot16(keys,t.cue.data(),scores);
+            for(size_t lane=0;lane<std::min(size_t(16),l.experts.size()-first);++lane){
+                size_t k=first+lane;++route_comparisons;
+                float score=scores[lane]+r.bias[k];
+                if(score>a){b=a;second=best;a=score;best=int(k);}else if(score>b){b=score;second=int(k);}
+            }
+        }
+    }
+    e.expert=best;e.runner=second;
+    for(int j=0;j<D;++j)t.key_difference[j]=l.experts[best].key[j]-l.experts[second].key[j];
+    float margin=dot(l.experts[best].key.data(),t.cue.data())-dot(l.experts[second].key.data(),t.cue.data());
+    float gate=std::tanh(margin);e.gate=1+.25f*gate;e.gate_derivative=.25f*(1-gate*gate);
+    if(training){
+        ++r.seen;++r.selections[best];
+        {
+            ++r.window[best];++r.window_count;
+            if(r.window_count==256){
+                // A level advances by its own minimum selections/expert.
+                // Strong correction fades after every expert has 256 examples.
+                auto minimum=*std::min_element(r.selections.begin(),r.selections.end());
+                float warm=std::clamp(1.f-float(minimum)/256.f,0.f,1.f);
+                float expected=256.f/r.bias.size(),average=0;
+                for(size_t k=0;k<r.bias.size();++k){
+                    // Coverage correction fades as the least-used expert
+                    // reaches 256 selections, then the accumulated bias decays.
+                    float decay=std::exp(-(1-warm)/float(r.bias.size()));
+                    float uniform=std::clamp((expected-float(r.window[k]))/expected,-1.f,1.f);
+                    r.bias[k]=decay*r.bias[k]+.04f*warm*uniform+0.f;
+                    r.bias[k]=std::clamp(r.bias[k],-.5f,.5f);average+=r.bias[k];r.window[k]=0;
+                }
+                average/=r.bias.size();for(auto& x:r.bias)x-=average;r.window_count=0;
+            }
+        }
+    }
+}
